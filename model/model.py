@@ -5,6 +5,7 @@ from transformers import PretrainedConfig
 import math
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
+from transformers.models.sew.modular_sew import _HIDDEN_STATES_START_POSITION
 
 
 class MokioMindConfig(PretrainedConfig):
@@ -275,8 +276,53 @@ class FeedForward(nn.Module):
         
 
 
+# 拼接一个 Transformer Block
 
+class MiniMindBlock(nn.Module):
+    def __init__(self,layer_id:int,config:MokioMindConfig):
+        super().__init__()
+        self.layer_id = layer_id
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
 
+        # 定义组件
+        self.self_attn = Attention(config)
+        self.input_layernorm = RMSNorm(self.hidden_size,eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(self.hidden_size,eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config)
+    
+    def forward(self,hidden_states,position_embeddings,past_key_value=None,use_cache=False,attention_mask=None):
+        residual = hidden_states
+        hidden_states,past_key_value = self.attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask
+        )
+        hidden_states += residual
+
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+        
+class MiniMindModel(nn.Module):
+    def __init__(self,config:MokioMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size,self.num_hidden_layers = config.vocab_size,config.num_hidden_layers
+
+        # 词嵌入
+        self.embed_tokens = nn.Embedding(config.vocab_size,config.hidden_size)
+        # dropout
+        self.dropout = nn.Dropout(config.dropout)
+        # transformer 隐藏层的集合
+        self.layers = nn.ModuleList(
+            [MiniMindBlock(l,config) for i in range(self.num_hidden_layers)]
+        )
+        # 归一化层
+        self.norm = RMSNorm(config.hidden_size,eps=config.rms_norm_eps)
 
 
         
