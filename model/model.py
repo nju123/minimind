@@ -1,12 +1,12 @@
-from typing import Optional,Tuple
+from typing import Optional,Tuple,Union,List
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 import math
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
-from transformers.models.sew.modular_sew import _HIDDEN_STATES_START_POSITION
-
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers import PreTrainedModel, GenerationMixin
 
 class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
@@ -167,7 +167,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int)-> torch.Tensor:
 class Attention(nn.Module):
     def __init__(self,args:MokioMindConfig):
         super().__init__()
-        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is not None else args.num_attention_heads
+        self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
         # attention_heads是指注意力头的数量，而num_key_value_heads是指键值头的数量
         assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
 
@@ -190,7 +190,7 @@ class Attention(nn.Module):
     def forward(
         self,
         x:torch.Tensor,
-        position_embedding:Tuple[torch.Tensor,torch.Tensor],
+        position_embeddings:Tuple[torch.Tensor,torch.Tensor],
         past_key_value:Optional[Tuple[torch.Tensor,torch.Tensor]]=None,
         use_cache=False,
         attention_mask:Optional[torch.Tensor]=None
@@ -207,7 +207,7 @@ class Attention(nn.Module):
         xv = xv.view(batch_size,seq_len,self.num_key_value_heads,self.head_dim)
 
         # 对于 q,k 使用 RoPE 位置编码
-        cos,sin = position_embedding
+        cos,sin = position_embeddings
         xq,xk = apply_rotate_pos_emb(xq,xk,cos,sin)
 
         # 使用 kv_cache
@@ -276,8 +276,7 @@ class FeedForward(nn.Module):
         
 
 
-# 拼接一个 Transformer Block
-
+# 拼接一个 Transformer Block ： 包含了自注意力层和前馈神经网络层
 class MiniMindBlock(nn.Module):
     def __init__(self,layer_id:int,config:MokioMindConfig):
         super().__init__()
@@ -294,7 +293,7 @@ class MiniMindBlock(nn.Module):
     
     def forward(self,hidden_states,position_embeddings,past_key_value=None,use_cache=False,attention_mask=None):
         residual = hidden_states
-        hidden_states,past_key_value = self.attn(
+        hidden_states,past_key_value = self.self_attn(
             self.input_layernorm(hidden_states),
             position_embeddings,
             past_key_value,
@@ -307,6 +306,8 @@ class MiniMindBlock(nn.Module):
             self.post_attention_layernorm(hidden_states)
         )
         
+        return hidden_states,past_key_value
+
 class MiniMindModel(nn.Module):
     def __init__(self,config:MokioMindConfig):
         super().__init__()
@@ -319,14 +320,124 @@ class MiniMindModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         # transformer 隐藏层的集合
         self.layers = nn.ModuleList(
-            [MiniMindBlock(l,config) for i in range(self.num_hidden_layers)]
+            [MiniMindBlock(l,config) for l in range(self.num_hidden_layers)]
         )
         # 归一化层
         self.norm = RMSNorm(config.hidden_size,eps=config.rms_norm_eps)
 
+        freqs_cos,freqs_sin = precompute_freqs_cis(
+            dim = config.hidden_size // config.num_attention_heads,
+            max_position_embeddings = config.max_position_embeddings,
+            rope_base = config.rope_theta,
+            rope_scaling = config.rope_scaling
+        )
 
+        # register_buffer 用来在模型中保存一些“状态”，但这些状态不是模型的参数（不需要被优化器更新，不需要计算梯度）。
+        # 如果直接赋值，当你把模型转移到 GPU (model.cuda()) 时，这个张量可能会被遗漏。用 register_buffer 注册后，PyTorch 就会把它当做模型的一部分，随模型一起移动设备。
+        self.register_buffer("freqs_cos",freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin",freqs_sin, persistent=False)
+    
+    def forward(self,
+        input_ids:torch.LongTensor = None,
+        attention_mask:torch.FloatTensor = None,
+        past_key_values:List[torch.FloatTensor] = None,
+        use_cache:bool = False,
+        **kwargs
+    ):
+        batch_size,seq_length = input_ids.shape
+
+        if hasattr(past_key_values,'layers'): past_key_values = None
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        # past_key_values的形状为：(num_layers,2,batch_size,num_heads,seq_length,head_dim)
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        position_embeddings = (
+            self.freqs_cos[start_pos:start_pos+seq_length],
+            self.freqs_sin[start_pos:start_pos+seq_length]
+        )
+
+        presents = []
+
+        for layer_idx, (layer,past_key_value) in enumerate(zip(self.layers,past_key_values)):
+            hidden_states,present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value,
+                use_cache,
+                attention_mask
+            )
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states, presents
+
+# PreTrainedModel: 这是 Hugging Face 库中的一个核心基类。继承它，意味着你的模型自动拥有了加载预训练权重 (.from_pretrained()) 和保存模型 (.save_pretrained()) 等极其强大的功能。
+# GenerationMixin: 这个类赋予了模型生成文本的能力。因为有了它，你之后就可以直接调用 model.generate() 方法来让大模型自己输出一段话，它内部封装了各种解码策略（如贪婪搜索、束搜索 Beam Search、Top-p 采样等）
+class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
+    config_class = MokioMindConfig
+
+    def __init__(self,config:MokioMindConfig):
+        self.config = config or MokioMindConfig()
+        super().__init__(config)
+        self.model = MiniMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size,config.vocab_size)
+        # 权重共享：编码与解码是互逆的过程，从语义上面来说很合理，而且能节省巨大的显存占用
+        # embedding 层是正着存放，然后 Linear 是反着存放（为了矩阵运算更快）
+        self.model.embed_tokens.weight = self.lm_head.weight
+    
+    def forward(self,
+                input_ids:Optional[torch.Tensor] = None,
+                attention_mask:Optional[torch.Tensor] = None,
+                # 训练时的标准答案，用于计算损失
+                labels:Optional[torch.Tensor] = None,
+                past_key_values:Optional[List[Tuple[torch.Tensor,torch.Tensor]]]=None,
+                use_cache: bool = False,
+                # 可以是整数或者tensor
+                logits_to_keep: Union[int,torch.Tensor] = 0,
+                **kwargs):
+        hidden_states,past_key_values = self.model(
+            input_ids,
+            attention_mask,
+            past_key_values,
+            use_cache,
+            **kwargs
+        )
+        # slice(start, stop) 是 Python 内置的切片对象。平时我们写的列表切片 my_list[-1:]，在底层其实就是 my_list[slice(-1, None)]。
+        # 这行代码的意思是：如果传入的 logits_to_keep 是个整数（比如 1），那我就创建一个切片对象 slice(-1, None)。如果它本身就是个张量（比如高级的索引掩码），那我就直接用它。
+        # 假设 logits_to_keep = 1，那么 slice_indices 现在就等价于 [-1:]。
+        slice_indices = slice(-logits_to_keep,None) if isinstance(logits_to_keep,int) else logits_to_keep
+
+        # 只取最后 logits_to_keep 个 token 的 logits
+        # hidden_state的形状是(batch_size,seq_length,hidden_size)
+        logits = self.lm_head(hidden_states[:,slice_indices,:])
+
+        loss = None
+
+        if labels is not None:
+            shift_logits = logits[:,:-1,:].contiguous()
+            shift_labels = labels[:,1:].contiguous()
+
+            loss = F.cross_entropy(
+                # cross_entropy的格式要求：(batch_size*seq_length,num_classes)
+                shift_logits.view(-1,shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100
+            )
         
-            
+        output = CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values
+        )
+
+        return output
+
+
+
 
 
 
