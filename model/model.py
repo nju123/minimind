@@ -274,39 +274,6 @@ class FeedForward(nn.Module):
     def forward(self,x):
         return self.dropout(self.down_proj((self.act_fn(self.gate_proj(x))*self.up_proj(x))))
         
-
-
-# 拼接一个 Transformer Block ： 包含了自注意力层和前馈神经网络层
-class MiniMindBlock(nn.Module):
-    def __init__(self,layer_id:int,config:MokioMindConfig):
-        super().__init__()
-        self.layer_id = layer_id
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_attention_heads
-
-        # 定义组件
-        self.self_attn = Attention(config)
-        self.input_layernorm = RMSNorm(self.hidden_size,eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(self.hidden_size,eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config)
-    
-    def forward(self,hidden_states,position_embeddings,past_key_value=None,use_cache=False,attention_mask=None):
-        residual = hidden_states
-        hidden_states,past_key_value = self.self_attn(
-            self.input_layernorm(hidden_states),
-            position_embeddings,
-            past_key_value,
-            use_cache,
-            attention_mask
-        )
-        hidden_states += residual
-
-        hidden_states = hidden_states + self.mlp(
-            self.post_attention_layernorm(hidden_states)
-        )
-        
-        return hidden_states,past_key_value
 class MOEFeedForward(nn.Module):
     def __init__(self,config:MokioMindConfig):
         super().__init__()
@@ -340,6 +307,46 @@ class MOEFeedForward(nn.Module):
                 y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
             elif self.training:
                 y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+        if self.training and self.config.router_aux_loss_coef > 0:
+            load = F.one_hot(topk_idx,self.config.num_experts).float().mean(0)
+            self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
+        else:
+            self.aux_loss = scores.new_zeros(1).squeeze()
+        return y.view(batch_size,seq_len,hidden_dim)
+            
+
+# 拼接一个 Transformer Block ： 包含了自注意力层和前馈神经网络层
+class MiniMindBlock(nn.Module):
+    def __init__(self,layer_id:int,config:MokioMindConfig):
+        super().__init__()
+        self.layer_id = layer_id
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
+
+        # 定义组件
+        self.self_attn = Attention(config)
+        self.input_layernorm = RMSNorm(self.hidden_size,eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(self.hidden_size,eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config)
+    
+    def forward(self,hidden_states,position_embeddings,past_key_value=None,use_cache=False,attention_mask=None):
+        residual = hidden_states
+        hidden_states,past_key_value = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask
+        )
+        hidden_states += residual
+
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+        
+        return hidden_states,past_key_value
+
 
 class MiniMindModel(nn.Module):
     def __init__(self,config:MokioMindConfig):
