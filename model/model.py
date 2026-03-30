@@ -307,6 +307,39 @@ class MiniMindBlock(nn.Module):
         )
         
         return hidden_states,past_key_value
+class MOEFeedForward(nn.Module):
+    def __init__(self,config:MokioMindConfig):
+        super().__init__()
+        self.config = config
+        self.gate = nn.Linear(config.hidden_size,config.num_experts,bias=False)
+        self.experts = nn.ModuleList([FeedForward(config,intermediate_size = config.moe_intermediate_size) for _ in range(config.num_experts)])
+        self.act_fn = ACTFN[config.hidden_act]
+
+    def forward(self,x):
+        batch_size,seq_len,hidden_dim = x.shape
+        # 展平
+        x_flat = x.view(-1,hidden_dim)
+        # 计算每个token经过gate之后得到的分数
+        # 维度：num_tokens x num_experts
+        scores = F.softmax(self.gate(x_flat),dim=-1)
+        # 取前 top-k 个作为 expert
+        topk_weight,topk_idx = torch.topk(scores,k=self.config.num_experts_per_tok,dim=-1,sorted=False)
+        # 对权重进行归一化
+        if self.config.norm_topk_prob:
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1,keepdim=True)+1e-20)
+        # 定义一个MOE输出结果的画布，之后在这上面填充结果
+        y = torch.zeros_like(x_flat)
+
+        for i,expert in enumerate(self.experts):
+            # 确定对于当前的 expert，有哪些 token 需要被这个 expert 来处理
+            mask = (topk_idx == i)
+            if mask.意思any():
+                token_idx = mask.any(dim=-1).nonzero().flatten()
+                weight = topk_weight[mask].view(-1,1)
+                # 这里 0的是 dim=0这个维度的下标和 token_idx 进行匹配
+                y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
+            elif self.training:
+                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
 
 class MiniMindModel(nn.Module):
     def __init__(self,config:MokioMindConfig):
