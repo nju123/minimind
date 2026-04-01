@@ -7,8 +7,9 @@ from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import PreTrainedModel, GenerationMixin
+from transformers.activations import ACT2FN
 
-class MokioMindConfig(PretrainedConfig):
+class MiniMindConfig(PretrainedConfig):
     model_type = "mokiomind"
 
     def __init__(
@@ -165,7 +166,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int)-> torch.Tensor:
         )
 
 class Attention(nn.Module):
-    def __init__(self,args:MokioMindConfig):
+    def __init__(self,args:MiniMindConfig):
         super().__init__()
         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
         # attention_heads是指注意力头的数量，而num_key_value_heads是指键值头的数量
@@ -254,7 +255,7 @@ class Attention(nn.Module):
 
             
 class FeedForward(nn.Module):
-    def __init__(self,args:MokioMindConfig):
+    def __init__(self,args:MiniMindConfig):
         super().__init__()
         if args.intermediate_size is None:
             intermediate_size = int(args.hidden_size * (8.0 / 3))
@@ -275,12 +276,12 @@ class FeedForward(nn.Module):
         return self.dropout(self.down_proj((self.act_fn(self.gate_proj(x))*self.up_proj(x))))
         
 class MOEFeedForward(nn.Module):
-    def __init__(self,config:MokioMindConfig):
+    def __init__(self,config:MiniMindConfig):
         super().__init__()
         self.config = config
         self.gate = nn.Linear(config.hidden_size,config.num_experts,bias=False)
         self.experts = nn.ModuleList([FeedForward(config,intermediate_size = config.moe_intermediate_size) for _ in range(config.num_experts)])
-        self.act_fn = ACTFN[config.hidden_act]
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self,x):
         batch_size,seq_len,hidden_dim = x.shape
@@ -317,7 +318,7 @@ class MOEFeedForward(nn.Module):
 
 # 拼接一个 Transformer Block ： 包含了自注意力层和前馈神经网络层
 class MiniMindBlock(nn.Module):
-    def __init__(self,layer_id:int,config:MokioMindConfig):
+    def __init__(self,layer_id:int,config:MiniMindConfig):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -349,7 +350,7 @@ class MiniMindBlock(nn.Module):
 
 
 class MiniMindModel(nn.Module):
-    def __init__(self,config:MokioMindConfig):
+    def __init__(self,config:MiniMindConfig):
         super().__init__()
         self.config = config
         self.vocab_size,self.num_hidden_layers = config.vocab_size,config.num_hidden_layers
@@ -418,10 +419,10 @@ class MiniMindModel(nn.Module):
 # PreTrainedModel: 这是 Hugging Face 库中的一个核心基类。继承它，意味着你的模型自动拥有了加载预训练权重 (.from_pretrained()) 和保存模型 (.save_pretrained()) 等极其强大的功能。
 # GenerationMixin: 这个类赋予了模型生成文本的能力。因为有了它，你之后就可以直接调用 model.generate() 方法来让大模型自己输出一段话，它内部封装了各种解码策略（如贪婪搜索、束搜索 Beam Search、Top-p 采样等）
 class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
-    config_class = MokioMindConfig
+    config_class = MiniMindConfig
 
-    def __init__(self,config:MokioMindConfig):
-        self.config = config or MokioMindConfig()
+    def __init__(self,config:MiniMindConfig):
+        self.config = config or MiniMindConfig()
         super().__init__(config)
         self.model = MiniMindModel(config)
         self.lm_head = nn.Linear(config.hidden_size,config.vocab_size)
